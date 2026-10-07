@@ -136,6 +136,20 @@ class Job:
         self.started = time.time()
         self._lock = threading.RLock()
         self.primary, self.generic = build_flag_regexes(flag_format)
+        # phase tracking for fast-first + manual deep scan
+        self.phase = "fast"        # fast | deep
+        self.deep_available = False  # set True when the fast phase finishes
+        self.deep_started = False
+        self.saved_path = None       # the uploaded file on disk
+        self.work_dir = None         # per-job working directory
+        # files discovered during the fast phase (host + extracted), each as
+        # (path, out_dir); the deep phase re-targets all of them.
+        self.discovered = []
+
+    def add_discovered(self, path, out_dir):
+        with self._lock:
+            if not any(p == path for p, _ in self.discovered):
+                self.discovered.append((path, out_dir))
 
     def log(self, msg, level="info"):
         with self._lock:
@@ -170,6 +184,9 @@ class Job:
                 "flags": list(self.flags),
                 "likely": list(self.likely),
                 "done": self.done,
+                "phase": self.phase,
+                "deep_available": self.deep_available,
+                "deep_started": self.deep_started,
             }
 
 

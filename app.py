@@ -17,7 +17,7 @@ from flask import (Flask, Response, jsonify, render_template, request,
                    stream_with_context)
 
 from core import util
-from core.pipeline import analyze
+from core.pipeline import analyze, deep
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(
@@ -65,11 +65,30 @@ def api_analyze():
     safe_name = os.path.basename(f.filename).replace("..", "_")
     saved = os.path.join(work_dir, safe_name)
     f.save(saved)
+    job.saved_path = saved
+    job.work_dir = work_dir
 
     t = threading.Thread(target=analyze, args=(saved, job, work_dir),
                          daemon=True)
     t.start()
     return jsonify({"job_id": job.id})
+
+
+@app.route("/api/deep/<job_id>", methods=["POST"])
+def api_deep(job_id):
+    if not _authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    job = util.get_job(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if not job.deep_available:
+        return jsonify({"error": "fast scan not finished yet"}), 409
+    if job.deep_started:
+        return jsonify({"error": "deep scan already started",
+                        "since": len(job.logs)}), 200
+    t = threading.Thread(target=deep, args=(job,), daemon=True)
+    t.start()
+    return jsonify({"job_id": job.id, "since": len(job.logs)})
 
 
 @app.route("/api/stream/<job_id>")
@@ -78,9 +97,14 @@ def api_stream(job_id):
     if not job:
         return jsonify({"error": "unknown job"}), 404
 
+    try:
+        start_since = int(request.args.get("since", "0"))
+    except ValueError:
+        start_since = 0
+
     @stream_with_context
     def gen():
-        sent = 0
+        sent = start_since
         while True:
             snap = job.snapshot(since=sent)
             if snap["logs"] or snap["done"]:
@@ -90,6 +114,9 @@ def api_stream(job_id):
                     "flags": snap["flags"],
                     "likely": snap["likely"],
                     "done": snap["done"],
+                    "phase": snap["phase"],
+                    "deep_available": snap["deep_available"],
+                    "deep_started": snap["deep_started"],
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
             if snap["done"]:

@@ -91,11 +91,16 @@
       </div>
       <input type="file" id="file" style="display:none">
 
-      <button id="go" disabled>ANALYZE</button>
+      <button id="go" disabled>FAST SCAN</button>
+      <button id="deep" style="display:none;background:var(--warn);color:#2a1e00">
+        ⚡ RUN DEEP SCAN (rockyou + Volatility)</button>
 
       <div class="hint">
         Tip: enter <b>XploitX</b> and it becomes <code>XploitX{…}</code>.
         Leave blank to match any <code>word{…}</code>.
+        <br><br><b>Fast scan</b> runs the quick checks (seconds).
+        <b>Deep scan</b> adds rockyou steghide/zip cracking, full-file XOR
+        and Volatility — slower, launch it only when you need it.
       </div>
       <div class="cats">
         Runs: identify + repair · strings/encodings · XOR · binwalk/foremost
@@ -126,8 +131,8 @@
 <script>
 const $ = s => document.querySelector(s);
 const drop = $("#drop"), fileInput = $("#file"), go = $("#go"),
-      logs = $("#logs"), dot = $("#statusdot");
-let chosen = null;
+      deepBtn = $("#deep"), logs = $("#logs"), dot = $("#statusdot");
+let chosen = null, currentJob = null;
 
 drop.onclick = () => fileInput.click();
 ["dragover","dragenter"].forEach(e=>drop.addEventListener(e,ev=>{
@@ -165,7 +170,8 @@ function renderFlags(id, arr, cls){
 
 go.onclick = () => {
   if(!chosen) return;
-  logs.innerHTML = ""; go.disabled = true; dot.classList.add("live");
+  logs.innerHTML = ""; go.disabled = true; deepBtn.style.display = "none";
+  dot.classList.add("live");
   const fd = new FormData();
   fd.append("file", chosen);
   fd.append("flag_format", $("#flagfmt").value);
@@ -175,19 +181,45 @@ go.onclick = () => {
     .then(j=>{
       if(j.error){ addLog({t:0,level:"warn",msg:"error: "+j.error});
         dot.classList.remove("live"); go.disabled=false; return; }
-      stream(j.job_id);
+      currentJob = j.job_id;
+      stream(currentJob, 0);
     });
 };
 
-function stream(id){
-  const es = new EventSource("/api/stream/"+id);
+deepBtn.onclick = () => {
+  if(!currentJob) return;
+  deepBtn.disabled = true; deepBtn.textContent = "⚡ deep scan running…";
+  dot.classList.add("live");
+  const body = new URLSearchParams();
+  const tokEl = $("#token"); if(tokEl) body.append("token", tokEl.value);
+  fetch("/api/deep/"+currentJob,{method:"POST",body})
+    .then(r=>r.json())
+    .then(j=>{
+      if(j.error && j.since===undefined){
+        addLog({t:0,level:"warn",msg:"error: "+j.error});
+        deepBtn.disabled=false; return; }
+      stream(currentJob, j.since||0);
+    });
+};
+
+function stream(id, since){
+  const es = new EventSource("/api/stream/"+id+"?since="+(since||0));
   es.onmessage = ev => {
     const d = JSON.parse(ev.data);
     (d.logs||[]).forEach(addLog);
     renderFlags("#flags", d.flags||[], "confirmed");
     renderFlags("#likely", d.likely||[], "likely");
-    if(d.done){ es.close(); dot.classList.remove("live"); go.disabled=false;
-      addLog({t:0,level:"section",msg:"— stream closed —"}); }
+    if(d.done){
+      es.close(); dot.classList.remove("live"); go.disabled=false;
+      // Offer the deep scan once the fast phase has finished.
+      if(d.deep_available && !d.deep_started){
+        deepBtn.style.display = "block"; deepBtn.disabled = false;
+        deepBtn.textContent = "⚡ RUN DEEP SCAN (rockyou + Volatility)";
+      } else {
+        deepBtn.style.display = "none";
+      }
+      addLog({t:0,level:"section",msg:"— "+(d.phase||"")+" stream closed —"});
+    }
   };
   es.onerror = () => { es.close(); dot.classList.remove("live");
     go.disabled=false; };

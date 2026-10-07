@@ -7,7 +7,26 @@ from . import util
 WORDLIST = "/usr/share/wordlists/rockyou.txt"
 
 
-def _crack_zip(path, job, out_dir):
+def _zip_try_python(z, pwset, job, out_dir):
+    """Try each password via python's zipfile; scan extracted contents."""
+    for pw in pwset:
+        try:
+            cdir = os.path.join(out_dir, "zip_cracked")
+            z.extractall(path=cdir, pwd=pw.encode("latin-1", "ignore"))
+            job.log(f"[+] zip password is '{pw}'", "flag")
+            for root, _, files in os.walk(cdir):
+                for fn in files:
+                    with open(os.path.join(root, fn), "rb") as f:
+                        job.scan(f.read().decode("latin-1", "replace"),
+                                 f"zip:{fn}")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _crack_zip_fast(path, job, out_dir):
+    """Fast phase: small built-in password list only."""
     try:
         z = zipfile.ZipFile(path)
     except Exception:
@@ -15,18 +34,33 @@ def _crack_zip(path, job, out_dir):
     encrypted = [zi for zi in z.infolist() if zi.flag_bits & 0x1]
     if not encrypted:
         return
-    job.log(f"[*] encrypted zip with {len(encrypted)} protected entries")
+    job.log(f"[*] encrypted zip with {len(encrypted)} protected entries "
+            "(trying quick list; use deep scan for rockyou)")
+    small = ["password", "flag", "ctf", "123456", "admin", "secret",
+             "infected", "letmein", "root", "toor"]
+    _zip_try_python(z, small, job, out_dir)
 
+
+def crack_zip_deep(path, job, out_dir):
+    """Deep phase: fcrackzip / zip2john+john / python, all with rockyou."""
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception:
+        return
+    if not any(zi.flag_bits & 0x1 for zi in z.infolist()):
+        return
     wordlist = WORDLIST if os.path.exists(WORDLIST) else None
+    if not wordlist:
+        job.log("[*] zip deep: rockyou not found, skipping", "warn")
+        return
+    job.log(f"[*] zip deep: rockyou brute force on {os.path.basename(path)}")
 
-    # Prefer fcrackzip, then john, then pure-python.
-    if util.have("fcrackzip") and wordlist:
-        rc, out, _ = util.run(
-            ["fcrackzip", "-D", "-p", wordlist, "-u", path])
+    if util.have("fcrackzip"):
+        rc, out, _ = util.run(["fcrackzip", "-D", "-p", wordlist, "-u", path])
         if "PASSWORD FOUND" in out:
             job.log(f"[+] fcrackzip: {out.strip()}", "flag")
             job.scan(out, "zip-crack")
-    if util.have("zip2john") and util.have("john") and wordlist:
+    if util.have("zip2john") and util.have("john"):
         h = os.path.join(out_dir, "zip.hash")
         rc, out, _ = util.run(["zip2john", path])
         if out:
@@ -37,29 +71,11 @@ def _crack_zip(path, job, out_dir):
             job.log(f"[*] john --show:\n{show}")
             job.scan(show, "zip-john")
 
-    # Pure-python fallback with a small list + rockyou.
-    pwset = ["password", "flag", "ctf", "123456", "admin", "secret", "infected"]
-    if wordlist:
-        try:
-            with open(wordlist, encoding="latin-1") as f:
-                pwset += [w.strip() for w in f]
-        except Exception:
-            pass
-    for pw in pwset:
-        try:
-            z.extractall(path=os.path.join(out_dir, "zip_cracked"),
-                         pwd=pw.encode("latin-1", "ignore"))
-            job.log(f"[+] zip password is '{pw}'", "flag")
-            cdir = os.path.join(out_dir, "zip_cracked")
-            for root, _, files in os.walk(cdir):
-                for fn in files:
-                    fp = os.path.join(root, fn)
-                    with open(fp, "rb") as f:
-                        job.scan(f.read().decode("latin-1", "replace"),
-                                 f"zip:{fn}")
-            return
-        except Exception:
-            continue
+    try:
+        with open(wordlist, encoding="latin-1") as f:
+            _zip_try_python(z, (w.strip() for w in f), job, out_dir)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _office(path, job):
@@ -103,6 +119,6 @@ def _pdf(path, job):
 def run(path, job, out_dir):
     job.section("7. ARCHIVES & DOCUMENTS")
     if zipfile.is_zipfile(path):
-        _crack_zip(path, job, out_dir)
+        _crack_zip_fast(path, job, out_dir)
     _office(path, job)
     _pdf(path, job)

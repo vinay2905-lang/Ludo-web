@@ -2,6 +2,7 @@
 import base64
 import binascii
 import codecs
+import os
 import re
 
 from . import util
@@ -127,17 +128,28 @@ def run(path, job):
         tested += 1
     job.log(f"[*] decoder chain tested {tested} strings")
 
-    # Single-byte XOR over the whole file (cheap, catches xor'd flags).
+    # Single-byte XOR over the whole file (cheap for small files).
     with open(path, "rb") as f:
         data = f.read()
-    if len(data) <= 5_000_000:
+    if len(data) <= 200_000:
         job.log("[*] brute-forcing single-byte XOR over raw bytes")
         xor_single_byte(data, job)
     else:
-        job.log("[*] file >5MB, skipping full-file XOR brute force", "warn")
+        job.log("[*] file >200KB — full-file XOR deferred to deep scan",
+                "warn")
 
     # system `strings` too (catches encodings python missed).
     if util.have("strings"):
         rc, out, _ = util.run(["strings", "-n", "6", path])
         if rc == 0:
             job.scan(out, "strings(binutils)")
+
+
+def deep(path, job):
+    """Deep phase: full-file single-byte XOR for larger files."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if 200_000 < len(data) <= 20_000_000:
+        job.log(f"[*] deep: single-byte XOR over {len(data)} bytes "
+                f"({os.path.basename(path)})")
+        xor_single_byte(data, job)

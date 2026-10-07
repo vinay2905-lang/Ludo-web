@@ -46,28 +46,15 @@ def _zsteg(path, job):
         job.scan(out, "zsteg")
 
 
-def _steghide(path, job, out_dir):
-    if not util.have("steghide"):
-        job.log("[!] steghide not installed", "warn")
-        return
-    # Try empty password, then a short built-in list + rockyou if present.
-    passwords = ["", "password", "flag", "ctf", "secret", "123456", "admin"]
-    extra = []
-    if os.path.exists(WORDLIST):
-        try:
-            with open(WORDLIST, encoding="latin-1") as f:
-                extra = [w.strip() for w in f]  # full list: "run everything"
-            job.log(f"[*] steghide: trying {len(extra)} rockyou passwords "
-                    "(this can take a while)")
-        except Exception:  # noqa: BLE001
-            pass
-    for pw in passwords + extra:
+def _steghide_try(path, job, out_dir, passwords, label):
+    for pw in passwords:
         out_file = os.path.join(out_dir, "steghide_out.bin")
         rc, _, err = util.run(
             ["steghide", "extract", "-sf", path, "-p", pw,
              "-xf", out_file, "-f"])
         if rc == 0 and os.path.exists(out_file):
-            job.log(f"[+] steghide extracted with password '{pw}' -> "
+            shown = pw if pw else "(empty)"
+            job.log(f"[+] steghide extracted with password '{shown}' -> "
                     f"{out_file}", "flag")
             try:
                 with open(out_file, "rb") as f:
@@ -75,7 +62,34 @@ def _steghide(path, job, out_dir):
             except Exception:  # noqa: BLE001
                 pass
             return out_file
-    job.log("[*] steghide: no password worked", "info")
+    job.log(f"[*] steghide: no password worked ({label})", "info")
+    return None
+
+
+def _steghide_fast(path, job, out_dir):
+    """Fast phase: empty password + a short built-in list only."""
+    if not util.have("steghide"):
+        job.log("[!] steghide not installed", "warn")
+        return
+    passwords = ["", "password", "flag", "ctf", "secret", "123456", "admin"]
+    return _steghide_try(path, job, out_dir, passwords, "quick list")
+
+
+def steghide_deep(path, job, out_dir):
+    """Deep phase: full rockyou brute force."""
+    if not util.have("steghide"):
+        return
+    if not os.path.exists(WORDLIST):
+        job.log("[*] steghide deep: rockyou not found, skipping", "warn")
+        return
+    try:
+        with open(WORDLIST, encoding="latin-1") as f:
+            words = [w.strip() for w in f]
+    except Exception:  # noqa: BLE001
+        return
+    job.log(f"[*] steghide deep: trying {len(words)} rockyou passwords on "
+            f"{os.path.basename(path)} (slow)")
+    return _steghide_try(path, job, out_dir, words, "rockyou")
 
 
 def _lsb_and_channels(path, job, out_dir):
@@ -154,7 +168,7 @@ def run(path, job, out_dir, ext):
     if ext in ("png", "bmp") or path.lower().endswith((".png", ".bmp")):
         _zsteg(path, job)
         _png_dimension_bruteforce(path, job, out_dir)
-    _steghide(path, job, out_dir)
+    _steghide_fast(path, job, out_dir)
     _lsb_and_channels(path, job, out_dir)
 
     # QR / barcode decode if present.
