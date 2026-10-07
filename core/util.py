@@ -49,13 +49,48 @@ def run(cmd, timeout=None, cwd=None, input_bytes=None):
 # ---------------------------------------------------------------------------
 # Flag handling
 # ---------------------------------------------------------------------------
-# Generic fallbacks always tried in addition to the user's format.
+# Generic fallbacks tried when the user gives no flag format. Deliberately
+# strict so random binary like "xx{|}" / "a7{<}" does NOT match: the prefix
+# must start with a letter and the body must start alphanumeric and contain a
+# run of at least 4 word-ish characters.
+# Body is restricted to characters real flags actually use (word chars plus a
+# little safe punctuation) and may not contain spaces, quotes, backslashes or
+# braces — which is what makes random binary spans like "a7{ <|\"}" stop
+# matching. A truly exotic flag format should be entered explicitly instead.
+_BODY = r"[A-Za-z0-9_][A-Za-z0-9_!?.@#$%+\-]{3,120}"
 GENERIC_FLAG_PATTERNS = [
-    r"[A-Za-z0-9_]{2,20}\{[^}\r\n]{1,256}\}",
-    r"flag\{[^}\r\n]{1,256}\}",
-    r"FLAG\{[^}\r\n]{1,256}\}",
-    r"CTF\{[^}\r\n]{1,256}\}",
+    r"[A-Za-z][A-Za-z0-9_]{1,19}\{" + _BODY + r"\}",
+    r"flag\{" + _BODY + r"\}",
+    r"FLAG\{" + _BODY + r"\}",
+    r"CTF\{" + _BODY + r"\}",
+    r"pico(?:CTF)?\{" + _BODY + r"\}",
 ]
+
+# Cap how many distinct "likely" (generic) hits we keep, so a noisy file
+# cannot flood the UI with thousands of near-random matches.
+MAX_LIKELY = 60
+
+
+def flag_score(flag):
+    """Heuristic: how much a generic match looks like a real CTF flag.
+
+    Real flags tend to have a longer body, contain underscores/digits, and be
+    mostly word characters rather than random punctuation.
+    """
+    body = flag[flag.find("{") + 1:flag.rfind("}")]
+    if not body:
+        return 0.0
+    import re as _re
+    L = len(body)
+    word = len(_re.findall(r"[A-Za-z0-9_]", body))
+    ratio = word / L
+    score = 20 * ratio                # mostly-word bodies look like flags
+    score += 8 if "_" in body else 0  # underscores are a strong signal
+    if L < 4:
+        score -= 10
+    if L > 60:                        # real flags are rarely very long;
+        score -= (L - 60) * 0.5       # random spans tend to be
+    return score
 
 
 def build_flag_regexes(flag_format):
@@ -98,8 +133,13 @@ def build_flag_regexes(flag_format):
     return compiled_primary, compiled_generic
 
 
-def find_flags(text, primary, generic):
-    """Return (confirmed, likely) lists of distinct flag strings found in text."""
+def find_flags(text, primary, generic, primary_only=False):
+    """Return (confirmed, likely) lists of distinct flag strings found in text.
+
+    primary_only=True skips the loose generic patterns entirely. Decoded and
+    XOR'd data MUST use this: matching a generic flag shape against decoded
+    random bytes is essentially always a false positive.
+    """
     if not text:
         return [], []
     confirmed, likely = [], []
@@ -110,12 +150,13 @@ def find_flags(text, primary, generic):
             if s not in seen:
                 seen.add(s)
                 confirmed.append(s)
-    for rx in generic:
-        for m in rx.findall(text):
-            s = m if isinstance(m, str) else m[0]
-            if s not in seen:
-                seen.add(s)
-                likely.append(s)
+    if not primary_only:
+        for rx in generic:
+            for m in rx.findall(text):
+                s = m if isinstance(m, str) else m[0]
+                if s not in seen:
+                    seen.add(s)
+                    likely.append(s)
     return confirmed, likely
 
 
@@ -132,6 +173,7 @@ class Job:
         self.logs = []            # list of {t, level, msg}
         self.flags = []           # confirmed flag strings
         self.likely = []          # likely flag strings (with source note)
+        self._likely_capped = False
         self.done = False
         self.started = time.time()
         self._lock = threading.RLock()
@@ -162,19 +204,39 @@ class Job:
         self.log(title, "section")
         self.log("=" * 60, "rule")
 
-    def scan(self, text, source):
-        """Scan a blob of text for flags and record any hits."""
-        confirmed, likely = find_flags(text, self.primary, self.generic)
+    def scan(self, text, source, primary_only=False):
+        """Scan a blob of text for flags and record any hits.
+
+        primary_only=True (used for decoded/XOR'd data) only reports matches
+        of the user's flag format, never the loose generic patterns.
+        """
+        confirmed, likely = find_flags(text, self.primary, self.generic,
+                                       primary_only=primary_only)
         with self._lock:
             for f in confirmed:
                 if f not in self.flags:
                     self.flags.append(f)
                     self.log(f"[+] FLAG FOUND ({source}): {f}", "flag")
             for f in likely:
-                tag = f"{f}  ⟵ {source}"
-                if not any(f == x.split("  ⟵")[0] for x in self.likely):
-                    self.likely.append(tag)
+                if any(f == x.split("  ⟵")[0] for x in self.likely):
+                    continue
+                if len(self.likely) < MAX_LIKELY:
+                    self.likely.append(f"{f}  ⟵ {source}")
                     self.log(f"[?] likely flag ({source}): {f}", "likely")
+                else:
+                    # Keep only the best-looking candidates once full: if this
+                    # one scores higher than the current weakest, swap it in.
+                    scored = [(flag_score(x.split("  ⟵")[0]), i)
+                              for i, x in enumerate(self.likely)]
+                    worst_score, worst_i = min(scored)
+                    if flag_score(f) > worst_score:
+                        self.likely[worst_i] = f"{f}  ⟵ {source}"
+                        self.log(f"[?] likely flag ({source}): {f}", "likely")
+                    if not self._likely_capped:
+                        self._likely_capped = True
+                        self.log(f"[*] likely list full ({MAX_LIKELY}); keeping"
+                                 " best-scoring — enter a flag format to filter",
+                                 "warn")
 
     def snapshot(self, since=0):
         with self._lock:
@@ -182,7 +244,10 @@ class Job:
                 "logs": self.logs[since:],
                 "total": len(self.logs),
                 "flags": list(self.flags),
-                "likely": list(self.likely),
+                "likely": sorted(
+                    self.likely,
+                    key=lambda x: flag_score(x.split("  ⟵")[0]),
+                    reverse=True),
                 "done": self.done,
                 "phase": self.phase,
                 "deep_available": self.deep_available,

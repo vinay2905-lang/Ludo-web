@@ -9,6 +9,33 @@ from . import util
 
 PRINTABLE = re.compile(rb"[\x20-\x7e]{4,}")
 
+# Above this many strings, the per-string rot/base64 chain is too slow and too
+# noisy (e.g. a disk image). We fall back to decoding only long encoded runs.
+DECODER_MAX_STRINGS = 20000
+
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
+_HEX_RUN = re.compile(r"(?:[0-9a-fA-F]{2}){16,}")
+
+
+def _targeted_decode(blob, job):
+    """For large inputs: decode only long base64/hex runs and flag-match them."""
+    n = 0
+    for m in _B64_RUN.finditer(blob):
+        d = _try_b64(m.group())
+        if d:
+            job.scan(d, "decode:b64-run")
+            n += 1
+        if n > 5000:
+            break
+    for m in _HEX_RUN.finditer(blob):
+        d = _try_hex(m.group())
+        if d:
+            job.scan(d, "decode:hex-run")
+            n += 1
+        if n > 10000:
+            break
+    job.log(f"[*] targeted decode examined {n} encoded runs")
+
 
 def extract_strings(path, min_len=4):
     """Pure-python strings (ASCII + UTF-16LE) so we don't depend on binutils."""
@@ -100,7 +127,7 @@ def xor_single_byte(data, job):
             txt = dec.decode("latin-1")
         except Exception:  # noqa: BLE001
             continue
-        job.scan(txt, f"xor:0x{key:02x}")
+        job.scan(txt, f"xor:0x{key:02x}", primary_only=True)
 
 
 def run(path, job):
@@ -111,22 +138,37 @@ def run(path, job):
     blob = "\n".join(strings)
     job.scan(blob, "strings")
 
-    # Decoder chain on each reasonably-sized token.
-    job.log("[*] running decoder chain (base64/32, hex, rot-N, url, reverse)")
-    tested = 0
-    for s in strings:
-        s = s.strip()
-        if len(s) < 6 or len(s) > 4096:
-            continue
-        for method, decoded in decoder_chain(s):
-            if decoded and decoded != s:
-                job.scan(decoded, f"decode:{method}")
-                # one level of nesting (e.g. base64 of hex)
-                for m2, d2 in decoder_chain(decoded):
-                    if d2 and d2 != decoded:
-                        job.scan(d2, f"decode:{method}>{m2}")
-        tested += 1
-    job.log(f"[*] decoder chain tested {tested} strings")
+    # The decoder chain only ever reports the USER's flag format (primary_only):
+    # matching a generic flag shape against decoded random bytes is noise.
+    # Methods that compose (base64/base32/hex/url) get one level of nesting;
+    # rot/reverse do not (a rot of a rot is just another rot).
+    NESTABLE = {"base64", "base32", "hex", "url"}
+    if len(strings) <= DECODER_MAX_STRINGS:
+        job.log("[*] decoder chain: base64/32, hex, rot-N, url, reverse "
+                "(flag-format matches only)")
+        tested = 0
+        for s in strings:
+            s = s.strip()
+            if len(s) < 6 or len(s) > 4096:
+                continue
+            for method, decoded in decoder_chain(s):
+                if not decoded or decoded == s:
+                    continue
+                job.scan(decoded, f"decode:{method}", primary_only=True)
+                if method in NESTABLE:
+                    for m2, d2 in decoder_chain(decoded):
+                        if d2 and d2 != decoded and m2 in NESTABLE:
+                            job.scan(d2, f"decode:{method}>{m2}",
+                                     primary_only=True)
+            tested += 1
+        job.log(f"[*] decoder chain tested {tested} strings")
+    else:
+        # Too many strings (big binary / disk image) to rot-shift them all.
+        # Target only long encoded-looking runs, which is where real encoded
+        # flags live.
+        job.log(f"[*] {len(strings)} strings > {DECODER_MAX_STRINGS}: decoder "
+                "chain limited to long base64/hex runs", "warn")
+        _targeted_decode(blob, job)
 
     # Single-byte XOR over the whole file (cheap for small files).
     with open(path, "rb") as f:
