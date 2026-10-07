@@ -77,25 +77,27 @@ def _dtmf(path, job):
     high = [1209, 1336, 1477, 1633]
     seq = []
     last = None
-    for i in range(0, len(data) - win, win):
+    for i in range(0, len(data) - win, win // 2):   # 50% overlap
         seg = data[i:i + win] * np.hanning(win)
         spec = np.abs(np.fft.rfft(seg))
         freqs = np.fft.rfftfreq(win, 1 / sr)
+        mean_mag = np.mean(spec) + 1e-9
 
-        def closest(group):
-            best, bestd = None, 1e9
+        def strongest(group):
+            """Return (freq, magnitude) of the loudest bin near the group."""
+            best, best_mag = None, 0.0
             for f in group:
-                idx = np.argmin(np.abs(freqs - f))
-                mag = spec[idx]
-                if mag > bestd * 0 and mag > np.mean(spec) * 5:
-                    if mag > bestd:
-                        bestd = mag
-                        best = f
-            return best
+                idx = int(np.argmin(np.abs(freqs - f)))
+                mag = float(spec[idx])
+                if mag > best_mag:
+                    best, best_mag = f, mag
+            return best, best_mag
 
-        lo = closest(low)
-        hi = closest(high)
-        if lo and hi and (lo, hi) in DTMF:
+        lo, lo_mag = strongest(low)
+        hi, hi_mag = strongest(high)
+        # Both tones must clearly stand above the noise floor.
+        if (lo_mag > mean_mag * 8 and hi_mag > mean_mag * 8
+                and (lo, hi) in DTMF):
             d = DTMF[(lo, hi)]
             if d != last:
                 seq.append(d)
