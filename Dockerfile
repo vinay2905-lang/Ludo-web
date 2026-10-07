@@ -44,6 +44,11 @@ COPY . .
 ENV PORT=8000
 EXPOSE 8000
 
-# gunicorn with a long timeout because "run everything" jobs are slow.
+# gunicorn with a long timeout because deep-scan jobs are slow.
+# IMPORTANT: a single worker — job state lives in-process memory, so upload,
+# SSE stream and deep-scan must all hit the same process. Multiple workers
+# would route the deep-scan request to a process that never saw the job
+# ("unknown job"). Concurrency comes from threads, which is right here since
+# the work is I/O-bound on external tools.
 RUN pip install gunicorn
-CMD ["sh", "-c", "gunicorn -w 2 -k gthread --threads 8 -t 0 -b 0.0.0.0:${PORT} app:app"]
+CMD ["sh", "-c", "gunicorn -w 1 -k gthread --threads 16 -t 0 -b 0.0.0.0:${PORT} app:app"]
