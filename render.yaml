@@ -1,0 +1,15 @@
+# Render blueprint. In the Render dashboard: New > Blueprint, point at this repo.
+services:
+  - type: web
+    name: forensics-autosolver
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # free tier OOMs on Volatility/large PCAP; starter = 2GB
+    healthCheckPath: /healthz
+    envVars:
+      - key: ACCESS_TOKEN  # set a secret so the public URL isn't open to all
+        generateValue: true
+      - key: MAX_UPLOAD_MB
+        value: "512"
+      - key: WORK_DIR
+        value: /tmp
